@@ -1,8 +1,11 @@
 """
-Local Web UI for the Ollama Excel Spending Analyzer Agent.
+Local Web UI for the Universal Ollama Excel Report Analyzer & Hybrid CAG+RAG Agent.
 
-Uses Python's built-in ThreadingHTTPServer (zero extra web dependencies) so it
-starts instantaneously and serves a modern drag-and-drop dashboard + AI chat UI.
+Supports:
+- Multi-file & multi-sheet Excel/CSV upload (.xlsx, .xlsm, .xls, .csv)
+- Transaction logs, Category x Month pivot sheets, monthly tabs, and general reports
+- Instant charts/KPIs + live token streaming from Ollama
+- Hybrid CAG + RAG Q&A chat with visible source citations
 
 Run:
     python web_ui.py
@@ -14,6 +17,7 @@ import argparse
 import json
 import tempfile
 import threading
+import time
 import uuid
 import webbrowser
 from email.parser import BytesParser
@@ -40,7 +44,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Ollama Excel Spending Agent</title>
+  <title>Ollama Universal Excel Agent (CAG + RAG)</title>
   <style>
     :root {
       --bg: #0b1120;
@@ -60,28 +64,29 @@ HTML_PAGE = r"""<!DOCTYPE html>
       margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
       background: var(--bg); color: var(--text); line-height: 1.55;
     }
-    .app { max-width: 1220px; margin: 0 auto; padding: 24px 18px 60px; }
+    .app { max-width: 1240px; margin: 0 auto; padding: 24px 18px 60px; }
     .topbar {
       display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center;
       gap: 14px; margin-bottom: 22px; padding-bottom: 16px; border-bottom: 1px solid var(--border);
     }
-    .brand h1 { margin: 0; font-size: 1.55rem; display: flex; align-items: center; gap: 10px; }
+    .brand h1 { margin: 0; font-size: 1.55rem; }
     .brand p { margin: 4px 0 0; color: var(--muted); font-size: 0.9rem; }
+    .pill-group { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     .pill {
       background: #0ea5e91f; border: 1px solid var(--accent); color: var(--accent);
-      padding: 4px 12px; border-radius: 999px; font-size: 0.82rem; font-weight: 600;
+      padding: 4px 12px; border-radius: 999px; font-size: 0.8rem; font-weight: 600;
     }
     .panel {
       background: var(--card); border: 1px solid var(--border); border-radius: 14px;
       padding: 20px; margin-bottom: 20px;
     }
     .controls {
-      display: grid; grid-template-columns: 1.5fr 1fr 0.7fr auto; gap: 14px; align-items: end;
+      display: grid; grid-template-columns: 1.6fr 1fr 0.7fr auto; gap: 14px; align-items: end;
     }
-    @media (max-width: 900px) { .controls { grid-template-columns: 1fr; } }
+    @media (max-width: 920px) { .controls { grid-template-columns: 1fr; } }
     label { display: block; font-size: 0.82rem; color: var(--muted); margin-bottom: 6px; font-weight: 600; }
     .dropzone {
-      border: 2px dashed #475569; border-radius: 10px; padding: 14px 16px;
+      border: 2px dashed #475569; border-radius: 10px; padding: 12px 16px;
       background: #0f172a; cursor: pointer; transition: border-color 0.2s, background 0.2s;
       display: flex; align-items: center; justify-content: space-between; gap: 10px;
     }
@@ -149,12 +154,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
     .ai-body table { margin: 12px 0; }
     .chat-box { display: flex; flex-direction: column; gap: 12px; }
     .chat-log {
-      max-height: 360px; overflow-y: auto; background: #0f172a; border: 1px solid var(--border);
+      max-height: 420px; overflow-y: auto; background: #0f172a; border: 1px solid var(--border);
       border-radius: 10px; padding: 14px; display: flex; flex-direction: column; gap: 10px;
     }
-    .msg { padding: 10px 14px; border-radius: 10px; max-width: 88%; font-size: 0.92rem; }
+    .msg { padding: 10px 14px; border-radius: 10px; max-width: 90%; font-size: 0.92rem; }
     .msg.user { align-self: flex-end; background: #1d4ed8; color: #fff; }
     .msg.bot { align-self: flex-start; background: #1e293b; border: 1px solid var(--border); }
+    .citations {
+      margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border);
+      font-size: 0.78rem; color: var(--muted);
+    }
+    .cite-tag {
+      display: inline-block; background: #0f172a; border: 1px solid #334155;
+      border-radius: 6px; padding: 2px 7px; margin: 3px 4px 0 0; color: #bae6fd;
+    }
     .chat-input-row { display: flex; gap: 10px; }
     .chat-input-row input { flex: 1; }
     a.dl-link {
@@ -168,20 +181,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="app">
     <div class="topbar">
       <div class="brand">
-        <h1>Excel Spending AI Agent</h1>
-        <p>Analyze any Excel/CSV expense sheet with local Ollama: full report, where you spend more, peak &amp; future month, and why it happens.</p>
+        <h1>Universal Excel Report Agent (CAG + RAG)</h1>
+        <p>Upload one or multiple Excel/CSV files (transactions, multi-tab monthly sheets, pivot budgets, or general tables) and ask any question.</p>
       </div>
-      <span class="pill" id="ollamaStatus">Connecting to Ollama...</span>
+      <div class="pill-group">
+        <span class="pill hidden" id="kbBadge">CAG + RAG Ready</span>
+        <span class="pill" id="ollamaStatus">Connecting to Ollama...</span>
+      </div>
     </div>
 
     <div class="panel">
       <div class="controls">
         <div>
-          <label>1. Upload Excel / CSV File</label>
+          <label>1. Upload Excel / CSV File(s)</label>
           <div class="dropzone" id="dropzone">
-            <span id="fileName">Click or drag &amp; drop .xlsx / .xls / .csv here</span>
+            <span id="fileName">Click or drag &amp; drop one or more .xlsx / .xls / .csv files</span>
             <button type="button" class="btn-secondary" style="padding:6px 12px;font-size:0.82rem;">Browse</button>
-            <input type="file" id="fileInput" accept=".xlsx,.xlsm,.xls,.csv" class="hidden" />
+            <input type="file" id="fileInput" accept=".xlsx,.xlsm,.xls,.csv" multiple class="hidden" />
           </div>
         </div>
         <div>
@@ -193,7 +209,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
           <input type="text" id="currencyInput" placeholder="Auto (₹, $, €)" />
         </div>
         <div class="btn-row">
-          <button type="button" class="btn-primary" id="analyzeBtn">Analyze Sheet</button>
+          <button type="button" class="btn-primary" id="analyzeBtn">Analyze Report(s)</button>
           <button type="button" class="btn-secondary" id="demoBtn">Run Demo</button>
         </div>
       </div>
@@ -208,21 +224,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
       <div class="grid-2">
         <div class="panel">
-          <h3 style="margin-top:0">Where You Spend More (Categories)</h3>
+          <h3 style="margin-top:0" id="catTitle">Top Categories / Groups</h3>
           <div id="categoryBars"></div>
         </div>
-        <div class="panel">
-          <h3 style="margin-top:0">Monthly Spending &amp; 3-Month Forecast</h3>
-          <div class="col-chart" id="monthlyChart"></div>
-          <div class="legend">
-            <span><span class="dot" style="background:var(--accent)"></span>Actual Month</span>
-            <span><span class="dot" style="background:var(--peak)"></span>Peak Month</span>
-            <span><span class="dot" style="background:var(--forecast)"></span>Projected (*Forecast)</span>
-          </div>
+        <div class="panel" id="rightChartPanel">
+          <h3 style="margin-top:0" id="rightChartTitle">Monthly Spending &amp; 3-Month Forecast</h3>
+          <div id="rightChartBody"></div>
         </div>
       </div>
 
-      <div class="grid-2">
+      <div class="grid-2" id="driversRow">
         <div class="panel">
           <h3 style="margin-top:0" id="whyTitle">Why Peak Month Spiked</h3>
           <div class="table-wrap" id="whyTable"></div>
@@ -237,21 +248,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="report-header">
           <h2 style="margin:0">Ollama AI Agent Report</h2>
           <div class="btn-row">
-            <a class="dl-link" id="dlHtml" href="#" target="_blank">Open Full HTML Report</a>
-            <a class="dl-link" id="dlMd" href="#" download>Download Markdown</a>
+            <a class="dl-link hidden" id="dlHtml" href="#" target="_blank">Open Full HTML Report</a>
+            <a class="dl-link hidden" id="dlMd" href="#" download>Download Markdown</a>
           </div>
         </div>
         <div class="ai-body" id="aiReport"></div>
       </div>
 
       <div class="panel">
-        <h3 style="margin-top:0">Ask Follow-up Questions (Ollama Agent Chat)</h3>
+        <h3 style="margin-top:0">Ask Any Question Across All Reports (Hybrid CAG + RAG Chat)</h3>
         <div class="chat-box">
           <div class="chat-log" id="chatLog">
-            <div class="msg bot">Ask me anything about your spreadsheet — e.g., "Why did October cost more?", "How much did I spend on Food?", or "Which subscriptions repeat every month?"</div>
+            <div class="msg bot">All sheets and report sections are cached (CAG) and indexed (RAG). Ask anything — totals, cross-sheet comparisons, specific rows, peak drivers, or forecasts.</div>
           </div>
           <div class="chat-input-row">
-            <input type="text" id="chatInput" placeholder="Ask a question about your expenses..." />
+            <input type="text" id="chatInput" placeholder="Ask any question based on your uploaded Excel report(s)..." />
             <button type="button" class="btn-primary" id="chatSendBtn">Ask</button>
           </div>
         </div>
@@ -260,7 +271,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <script>
-    let selectedFile = null;
+    let selectedFiles = [];
     let currentSessionId = null;
 
     const dropzone = document.getElementById('dropzone');
@@ -274,6 +285,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     const statusSpinner = document.getElementById('statusSpinner');
     const statusText = document.getElementById('statusText');
     const resultsSection = document.getElementById('resultsSection');
+    const kbBadge = document.getElementById('kbBadge');
 
     function setStatus(msg, loading = true, isError = false) {
       statusBar.classList.add('visible');
@@ -291,7 +303,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
       return cur + Number(val).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     }
 
-    // Minimal markdown renderer for AI prose & tables
     function renderMarkdown(md) {
       const lines = String(md || '').split(/\r?\n/);
       let out = [];
@@ -363,7 +374,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         modelSelect.innerHTML = '';
         data.models.forEach(m => {
           const opt = document.createElement('option');
-          opt.value = m; opt.textContent = m;
+          opt.value = m;
+          let label = m;
+          if (m === 'qwen2.5-coder:3b') label = `${m} (Fastest ~16s)`;
+          else if (m === 'qwen2.5:latest') label = `${m} (Best Quality ~41s)`;
+          opt.textContent = label;
           if (m === data.recommended) opt.selected = true;
           modelSelect.appendChild(opt);
         });
@@ -377,21 +392,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
       }
     }
 
+    function setFileList(fileList) {
+      selectedFiles = Array.from(fileList || []);
+      if (selectedFiles.length === 1) fileNameEl.textContent = selectedFiles[0].name;
+      else if (selectedFiles.length > 1) fileNameEl.textContent = `${selectedFiles.length} files: ${selectedFiles.map(f => f.name).join(', ')}`;
+    }
+
     dropzone.addEventListener('click', () => fileInput.click());
-    fileInput.addEventListener('change', () => {
-      if (fileInput.files.length) {
-        selectedFile = fileInput.files[0];
-        fileNameEl.textContent = selectedFile.name;
-      }
-    });
+    fileInput.addEventListener('change', () => setFileList(fileInput.files));
     dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
     dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
     dropzone.addEventListener('drop', e => {
       e.preventDefault(); dropzone.classList.remove('dragover');
-      if (e.dataTransfer.files.length) {
-        selectedFile = e.dataTransfer.files[0];
-        fileNameEl.textContent = selectedFile.name;
-      }
+      if (e.dataTransfer.files.length) setFileList(e.dataTransfer.files);
     });
 
     function renderAnalytics(data) {
@@ -402,126 +415,125 @@ HTML_PAGE = r"""<!DOCTYPE html>
       const mon = b.monthly_spending;
       const fc = b.future_month_forecast;
       const why = b.why_peak_month_happened;
+      const profiles = b.sheet_profiles || [];
       const cur = ov.currency;
-      const nextPeak = fc.highest_projected_upcoming_month || {};
+      const isSpending = ov.report_mode === 'spending' && mon.months_chronological.length > 0;
+      const topCat = where.top_category || { category: 'N/A', total_spend: 0, share_percent: 0 };
 
-      document.getElementById('kpiGrid').innerHTML = `
-        <div class="kpi">
-          <div class="kpi-label">Total Spending</div>
-          <div class="kpi-val">${fmtMoney(ov.total_spend, cur)}</div>
-          <div class="kpi-sub">${ov.transaction_count} transactions (${ov.date_range.start} to ${ov.date_range.end})</div>
-        </div>
-        <div class="kpi">
-          <div class="kpi-label">Where You Spend Most</div>
-          <div class="kpi-val">${escapeHtml(where.top_category.category)}</div>
-          <div class="kpi-sub">${fmtMoney(where.top_category.total_spend, cur)} (${where.top_category.share_percent}% of total)</div>
-        </div>
-        <div class="kpi">
-          <div class="kpi-label">Peak Spending Month</div>
-          <div class="kpi-val">${escapeHtml(mon.peak_month.month)}</div>
-          <div class="kpi-sub">${fmtMoney(mon.peak_month.total_spend, cur)} (${mon.peak_month.vs_monthly_avg_percent >= 0 ? '+' : ''}${mon.peak_month.vs_monthly_avg_percent}% vs avg)</div>
-        </div>
-        <div class="kpi">
-          <div class="kpi-label">Next High-Spend Month Forecast</div>
-          <div class="kpi-val">${escapeHtml(nextPeak.month || 'N/A')}</div>
-          <div class="kpi-sub">Projected ${fmtMoney(nextPeak.projected_spend, cur)} (Trend: ${escapeHtml(fc.trend_direction)})</div>
-        </div>
-      `;
+      kbBadge.textContent = `${data.retrieval_mode} (${data.indexed_chunks} chunks, ${profiles.length} sheet(s))`;
+      kbBadge.classList.remove('hidden');
 
-      const maxCat = Math.max(...where.categories.map(c => c.total_spend), 1);
-      document.getElementById('categoryBars').innerHTML = where.categories.slice(0, 8).map(c => `
+      if (isSpending) {
+        const nextPeak = fc.highest_projected_upcoming_month || {};
+        document.getElementById('kpiGrid').innerHTML = `
+          <div class="kpi"><div class="kpi-label">Total Spending</div><div class="kpi-val">${fmtMoney(ov.total_spend, cur)}</div><div class="kpi-sub">${ov.transaction_count} records (${ov.date_range.start} to ${ov.date_range.end})</div></div>
+          <div class="kpi"><div class="kpi-label">Where You Spend Most</div><div class="kpi-val">${escapeHtml(topCat.category)}</div><div class="kpi-sub">${fmtMoney(topCat.total_spend, cur)} (${topCat.share_percent}% of total)</div></div>
+          <div class="kpi"><div class="kpi-label">Peak Spending Month</div><div class="kpi-val">${escapeHtml(mon.peak_month.month)}</div><div class="kpi-sub">${fmtMoney(mon.peak_month.total_spend, cur)} (${mon.peak_month.vs_monthly_avg_percent >= 0 ? '+' : ''}${mon.peak_month.vs_monthly_avg_percent}% vs avg)</div></div>
+          <div class="kpi"><div class="kpi-label">Next High-Spend Forecast</div><div class="kpi-val">${escapeHtml(nextPeak.month || 'N/A')}</div><div class="kpi-sub">Projected ${fmtMoney(nextPeak.projected_spend, cur)} (Trend: ${escapeHtml(fc.trend_direction)})</div></div>
+        `;
+      } else {
+        document.getElementById('kpiGrid').innerHTML = `
+          <div class="kpi"><div class="kpi-label">Primary Total</div><div class="kpi-val">${fmtMoney(ov.total_spend, cur)}</div><div class="kpi-sub">${ov.transaction_count} rows parsed</div></div>
+          <div class="kpi"><div class="kpi-label">Top Group / Category</div><div class="kpi-val">${escapeHtml(topCat.category)}</div><div class="kpi-sub">${fmtMoney(topCat.total_spend, cur)} (${topCat.share_percent}%)</div></div>
+          <div class="kpi"><div class="kpi-label">Sheets Analyzed</div><div class="kpi-val">${profiles.length} Sheet(s)</div><div class="kpi-sub">Mode: General Tabular Report</div></div>
+          <div class="kpi"><div class="kpi-label">RAG Knowledge Index</div><div class="kpi-val">${data.indexed_chunks} Chunks</div><div class="kpi-sub">Ready for Q&amp;A across all rows</div></div>
+        `;
+      }
+
+      const maxCat = Math.max(...(where.categories || []).map(c => c.total_spend), 1);
+      document.getElementById('categoryBars').innerHTML = (where.categories || []).slice(0, 8).map(c => `
         <div class="bar-row">
           <div class="bar-label"><span>${escapeHtml(c.category)}</span><span>${fmtMoney(c.total_spend, cur)} (${c.share_percent}%)</span></div>
           <div class="bar-track"><div class="bar-fill" style="width:${Math.min(100, c.total_spend / maxCat * 100).toFixed(1)}%"></div></div>
         </div>
-      `).join('');
+      `).join('') || '<p style="color:var(--muted)">No categorical groups detected; see AI report and chat.</p>';
 
-      const allVals = [
-        ...mon.months_chronological.map(m => m.total_spend),
-        ...fc.next_3_months_forecast.map(f => f.projected_spend)
-      ];
-      const maxMon = Math.max(...allVals, 1);
-      const peakM = mon.peak_month.month;
-      document.getElementById('monthlyChart').innerHTML =
-        mon.months_chronological.map(m => `
-          <div class="col-item ${m.month === peakM ? 'peak' : ''}">
-            <div class="col-val">${fmtMoney(m.total_spend, cur)}</div>
-            <div class="col-track"><div class="col-fill" style="height:${Math.max(5, m.total_spend / maxMon * 100).toFixed(1)}%"></div></div>
-            <div class="col-lbl">${escapeHtml(m.month)}</div>
-          </div>
-        `).join('') +
-        fc.next_3_months_forecast.map(f => `
-          <div class="col-item forecast">
-            <div class="col-val">${fmtMoney(f.projected_spend, cur)}</div>
-            <div class="col-track"><div class="col-fill" style="height:${Math.max(5, f.projected_spend / maxMon * 100).toFixed(1)}%"></div></div>
-            <div class="col-lbl">${escapeHtml(f.month)}*</div>
-          </div>
-        `).join('');
+      const rightTitle = document.getElementById('rightChartTitle');
+      const rightBody = document.getElementById('rightChartBody');
+      const driversRow = document.getElementById('driversRow');
 
-      document.getElementById('whyTitle').textContent = `Why ${why.analyzed_month} Spiked (vs Monthly Baseline)`;
-      document.getElementById('whyTable').innerHTML = `
-        <table>
-          <thead><tr><th>Category</th><th>${escapeHtml(why.analyzed_month)}</th><th>Baseline Avg</th><th>Difference</th></tr></thead>
-          <tbody>
-            ${why.top_category_surges.map(d => `
-              <tr>
-                <td>${escapeHtml(d.category)}</td>
-                <td>${fmtMoney(d.target_month_spend, cur)}</td>
-                <td>${fmtMoney(d.baseline_monthly_avg, cur)}</td>
-                <td class="${d.difference > 0 ? 'pos-bad' : 'pos-good'}">${d.difference >= 0 ? '+' : ''}${d.difference.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})} (${d.percent_vs_baseline >= 0 ? '+' : ''}${d.percent_vs_baseline}%)</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      `;
+      if (isSpending) {
+        rightTitle.textContent = 'Monthly Spending & 3-Month Forecast';
+        const allVals = [
+          ...mon.months_chronological.map(m => m.total_spend),
+          ...fc.next_3_months_forecast.map(f => f.projected_spend)
+        ];
+        const maxMon = Math.max(...allVals, 1);
+        const peakM = mon.peak_month.month;
+        rightBody.innerHTML = `<div class="col-chart">` +
+          mon.months_chronological.map(m => `
+            <div class="col-item ${m.month === peakM ? 'peak' : ''}">
+              <div class="col-val">${fmtMoney(m.total_spend, cur)}</div>
+              <div class="col-track"><div class="col-fill" style="height:${Math.max(5, m.total_spend / maxMon * 100).toFixed(1)}%"></div></div>
+              <div class="col-lbl">${escapeHtml(m.month)}</div>
+            </div>
+          `).join('') +
+          fc.next_3_months_forecast.map(f => `
+            <div class="col-item forecast">
+              <div class="col-val">${fmtMoney(f.projected_spend, cur)}</div>
+              <div class="col-track"><div class="col-fill" style="height:${Math.max(5, f.projected_spend / maxMon * 100).toFixed(1)}%"></div></div>
+              <div class="col-lbl">${escapeHtml(f.month)}*</div>
+            </div>
+          `).join('') + `</div>
+          <div class="legend">
+            <span><span class="dot" style="background:var(--accent)"></span>Actual Month</span>
+            <span><span class="dot" style="background:var(--peak)"></span>Peak Month</span>
+            <span><span class="dot" style="background:var(--forecast)"></span>Projected (*Forecast)</span>
+          </div>`;
 
-      document.getElementById('spikeTitle').textContent = `Top Transactions in ${why.analyzed_month}`;
-      document.getElementById('spikeTable').innerHTML = `
-        <table>
-          <thead><tr><th>Date</th><th>Description</th><th>Category</th><th>Amount</th><th>Share</th></tr></thead>
-          <tbody>
-            ${why.top_transactions_in_month.slice(0, 6).map(t => `
-              <tr>
-                <td>${escapeHtml(t.date)}</td>
-                <td>${escapeHtml(t.description)}</td>
-                <td>${escapeHtml(t.category)}</td>
-                <td>${fmtMoney(t.amount, cur)}</td>
-                <td>${t.share_of_month_percent}%</td>
-              </tr>
-            `).join('')}
-          </tbody>
-        </table>
-      `;
+        driversRow.classList.remove('hidden');
+        document.getElementById('whyTitle').textContent = `Why ${why.analyzed_month} Spiked (vs Baseline)`;
+        document.getElementById('whyTable').innerHTML = `
+          <table><thead><tr><th>Category</th><th>${escapeHtml(why.analyzed_month)}</th><th>Baseline Avg</th><th>Difference</th></tr></thead>
+          <tbody>${why.top_category_surges.map(d => `
+            <tr><td>${escapeHtml(d.category)}</td><td>${fmtMoney(d.target_month_spend, cur)}</td><td>${fmtMoney(d.baseline_monthly_avg, cur)}</td>
+            <td class="${d.difference > 0 ? 'pos-bad' : 'pos-good'}">${d.difference >= 0 ? '+' : ''}${d.difference.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})} (${d.percent_vs_baseline >= 0 ? '+' : ''}${d.percent_vs_baseline}%)</td></tr>
+          `).join('')}</tbody></table>`;
+        document.getElementById('spikeTitle').textContent = `Top Transactions in ${why.analyzed_month}`;
+        document.getElementById('spikeTable').innerHTML = `
+          <table><thead><tr><th>Date</th><th>Description</th><th>Category</th><th>Amount</th><th>Share</th></tr></thead>
+          <tbody>${why.top_transactions_in_month.slice(0, 6).map(t => `
+            <tr><td>${escapeHtml(t.date)}</td><td>${escapeHtml(t.description)}</td><td>${escapeHtml(t.category)}</td><td>${fmtMoney(t.amount, cur)}</td><td>${t.share_of_month_percent}%</td></tr>
+          `).join('')}</tbody></table>`;
+      } else {
+        rightTitle.textContent = 'Sheets Indexed in CAG + RAG';
+        rightBody.innerHTML = `<div class="table-wrap"><table><thead><tr><th>File</th><th>Sheet</th><th>Kind</th><th>Rows</th></tr></thead><tbody>` +
+          profiles.map(p => `<tr><td>${escapeHtml(p.file)}</td><td>${escapeHtml(p.sheet)}</td><td>${escapeHtml(p.kind)}</td><td>${p.row_count}</td></tr>`).join('') +
+          `</tbody></table></div>`;
+        driversRow.classList.add('hidden');
+      }
 
-      document.getElementById('aiReport').innerHTML = '<p style="color:var(--muted)">Generating Ollama AI narrative report...</p>';
+      document.getElementById('aiReport').innerHTML = '<p style="color:var(--muted)">Streaming Ollama AI report...</p>';
       document.getElementById('dlHtml').classList.add('hidden');
       document.getElementById('dlMd').classList.add('hidden');
       resultsSection.classList.remove('hidden');
     }
 
     async function runAnalysis(useDemo) {
-      if (!useDemo && !selectedFile) {
-        setStatus('Please select an Excel/CSV file first, or click "Run Demo".', false, true);
+      if (!useDemo && selectedFiles.length === 0) {
+        setStatus('Please select one or more Excel/CSV files first, or click "Run Demo".', false, true);
         return;
       }
       analyzeBtn.disabled = true;
       demoBtn.disabled = true;
       const chosenModel = modelSelect.value;
-      setStatus('Parsing Excel sheet and computing spending analytics...', true);
+      setStatus('Parsing all sheets and indexing CAG + RAG knowledge base...', true);
 
       try {
         const form = new FormData();
         form.append('model', chosenModel);
         form.append('currency', currencyInput.value.trim());
         form.append('demo', useDemo ? '1' : '0');
-        if (!useDemo && selectedFile) form.append('file', selectedFile);
+        if (!useDemo) {
+          for (const f of selectedFiles) form.append('file', f);
+        }
 
         const parseRes = await fetch('/api/parse', { method: 'POST', body: form });
         const parseData = await parseRes.json();
-        if (!parseRes.ok) throw new Error(parseData.error || 'Failed to parse spreadsheet');
+        if (!parseRes.ok) throw new Error(parseData.error || 'Failed to parse report(s)');
 
         renderAnalytics(parseData);
-        setStatus(`Charts ready! Streaming report from Ollama (${chosenModel})...`, true);
+        setStatus(`Indexed ${parseData.indexed_chunks} RAG chunks! Streaming report from Ollama (${chosenModel})...`, true);
 
         const repRes = await fetch('/api/report_stream', {
           method: 'POST',
@@ -554,21 +566,20 @@ HTML_PAGE = r"""<!DOCTYPE html>
               streamedMd += ev.token;
               aiReportEl.innerHTML = renderMarkdown(streamedMd);
             }
-            if (ev.done) {
-              doneMeta = ev;
-            }
+            if (ev.done) doneMeta = ev;
           }
         }
 
         if (doneMeta) {
           aiReportEl.innerHTML = renderMarkdown(doneMeta.report_markdown || streamedMd);
+          kbBadge.textContent = `${doneMeta.retrieval_mode} (${doneMeta.indexed_chunks} chunks)`;
           const dlHtml = document.getElementById('dlHtml');
           const dlMd = document.getElementById('dlMd');
           dlHtml.href = `/api/download/${encodeURIComponent(doneMeta.html_filename)}`;
           dlMd.href = `/api/download/${encodeURIComponent(doneMeta.md_filename)}`;
           dlHtml.classList.remove('hidden');
           dlMd.classList.remove('hidden');
-          setStatus(`Done in ${doneMeta.elapsed_sec}s with ${doneMeta.model}!`, false);
+          setStatus(`Done in ${doneMeta.elapsed_sec}s with ${doneMeta.model}! Report sections indexed into RAG for Q&A.`, false);
         }
       } catch (err) {
         setStatus(`Error: ${err.message}`, false, true);
@@ -590,7 +601,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
       log.innerHTML += `<div class="msg user">${escapeHtml(q)}</div>`;
       const botDiv = document.createElement('div');
       botDiv.className = 'msg bot';
-      botDiv.textContent = 'Thinking with Ollama...';
+      botDiv.textContent = 'Retrieving CAG + RAG evidence and querying Ollama...';
       log.appendChild(botDiv);
       log.scrollTop = log.scrollHeight;
 
@@ -602,7 +613,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Chat failed');
-        botDiv.innerHTML = renderMarkdown(data.answer);
+        const citeHtml = (data.citations || []).length
+          ? `<div class="citations"><strong>${escapeHtml(data.retrieval_mode || 'CAG + RAG')}:</strong> <span class="cite-tag">CAG Global Summary</span>` +
+            data.citations.map(c => `<span class="cite-tag">${escapeHtml(c.source)}</span>`).join('') + `</div>`
+          : '';
+        botDiv.innerHTML = renderMarkdown(data.answer) + citeHtml;
       } catch (err) {
         botDiv.textContent = `Error: ${err.message}`;
       }
@@ -625,7 +640,6 @@ class SpendingUIHandler(BaseHTTPRequestHandler):
     ollama_host = DEFAULT_OLLAMA_HOST
 
     def log_message(self, format: str, *args: Any) -> None:
-        # Keep console output clean
         return
 
     def _send_json(self, payload: dict[str, Any], status: int = HTTPStatus.OK) -> None:
@@ -696,12 +710,12 @@ class SpendingUIHandler(BaseHTTPRequestHandler):
         self.send_error(HTTPStatus.NOT_FOUND)
 
     @staticmethod
-    def _parse_multipart(content_type: str, body: bytes) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
-        """Parse multipart/form-data without deprecated cgi module (Python 3.13+ safe)."""
+    def _parse_multipart(content_type: str, body: bytes) -> tuple[dict[str, str], list[tuple[str, bytes]]]:
+        """Parse multipart/form-data supporting multiple uploaded files (Python 3.13+ safe)."""
         header_bytes = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
         msg = BytesParser(policy=email_policy).parsebytes(header_bytes + body)
         fields: dict[str, str] = {}
-        files: dict[str, tuple[str, bytes]] = {}
+        uploaded_files: list[tuple[str, bytes]] = []
         for part in msg.iter_parts():
             name = part.get_param("name", header="content-disposition")
             if not name:
@@ -709,51 +723,57 @@ class SpendingUIHandler(BaseHTTPRequestHandler):
             filename = part.get_filename()
             payload = part.get_payload(decode=True) or b""
             if filename:
-                files[name] = (filename, payload)
+                uploaded_files.append((filename, payload))
             else:
                 fields[name] = payload.decode("utf-8", errors="replace")
-        return fields, files
+        return fields, uploaded_files
 
-    def _parse_upload_to_session(self) -> tuple[str, dict[str, Any]]:
+    def _parse_upload_to_session(self) -> tuple[str, dict[str, Any], OllamaSpendingAgent]:
         ctype = self.headers.get("Content-Type", "")
         if "multipart/form-data" not in ctype:
             raise ValueError("Expected multipart/form-data")
 
         length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(length)
-        fields, files = self._parse_multipart(ctype, raw_body)
+        fields, uploaded_files = self._parse_multipart(ctype, raw_body)
 
         model = (fields.get("model") or "").strip() or None
         currency = (fields.get("currency") or "").strip() or None
         is_demo = fields.get("demo") == "1"
 
         if is_demo:
-            excel_path = generate_sample_excel("sample_expenses.xlsx")
+            excel_paths = [generate_sample_excel("sample_expenses.xlsx")]
             stem = "sample_expenses"
         else:
-            if "file" not in files:
+            if not uploaded_files:
                 raise ValueError("No file uploaded")
-            orig_name, file_bytes = files["file"]
-            orig_name = Path(orig_name).name
-            suffix = Path(orig_name).suffix.lower() or ".xlsx"
-            stem = Path(orig_name).stem
             tmp_dir = Path(tempfile.mkdtemp(prefix="excel_agent_"))
-            excel_path = tmp_dir / f"{stem}{suffix}"
-            excel_path.write_bytes(file_bytes)
+            excel_paths = []
+            for orig_name, file_bytes in uploaded_files:
+                clean_name = Path(orig_name).name
+                dest = tmp_dir / clean_name
+                dest.write_bytes(file_bytes)
+                excel_paths.append(dest)
+            stem = excel_paths[0].stem if len(excel_paths) == 1 else "combined_reports"
 
-        analyzer = ExpenseAnalyzer(excel_path, currency_override=currency)
+        analyzer = ExpenseAnalyzer(excel_paths, currency_override=currency)
         bundle = analyzer.build_full_analytics_bundle()
         agent = OllamaSpendingAgent(analyzer=analyzer, model=model, host=self.ollama_host)
 
         session_id = uuid.uuid4().hex
         with SESSIONS_LOCK:
             SESSIONS[session_id] = {"agent": agent, "bundle": bundle, "stem": stem}
-        return session_id, bundle
+        return session_id, bundle, agent
 
     def _handle_parse(self) -> None:
         try:
-            session_id, bundle = self._parse_upload_to_session()
-            self._send_json({"session_id": session_id, "bundle": bundle})
+            session_id, bundle, agent = self._parse_upload_to_session()
+            self._send_json({
+                "session_id": session_id,
+                "bundle": bundle,
+                "retrieval_mode": "CAG + Hybrid BM25/Vector RAG" if agent.kb.embedding_model else "CAG + BM25 RAG",
+                "indexed_chunks": len(agent.kb.chunks),
+            })
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
         except Exception as exc:
@@ -782,12 +802,12 @@ class SpendingUIHandler(BaseHTTPRequestHandler):
                 "report_markdown": report_md,
                 "md_filename": md_path.name,
                 "html_filename": html_path.name,
+                "indexed_chunks": len(agent.kb.chunks),
             })
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
     def _handle_report_stream(self) -> None:
-        import time as _time
         try:
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -808,7 +828,7 @@ class SpendingUIHandler(BaseHTTPRequestHandler):
                 self.wfile.write(line)
                 self.wfile.flush()
 
-            t0 = _time.perf_counter()
+            t0 = time.perf_counter()
             agent = session["agent"]
             bundle = session["bundle"]
             stem = session["stem"]
@@ -817,7 +837,7 @@ class SpendingUIHandler(BaseHTTPRequestHandler):
                 on_token=lambda tok: _emit({"token": tok}),
             )
             md_path, html_path = save_reports(bundle, report_md, agent.model, REPORTS_DIR, stem=stem)
-            elapsed = round(_time.perf_counter() - t0, 1)
+            elapsed = round(time.perf_counter() - t0, 1)
             _emit({
                 "done": True,
                 "model": agent.model,
@@ -826,6 +846,8 @@ class SpendingUIHandler(BaseHTTPRequestHandler):
                 "md_filename": md_path.name,
                 "html_filename": html_path.name,
                 "elapsed_sec": elapsed,
+                "retrieval_mode": "CAG + Hybrid BM25/Vector RAG" if agent.kb.embedding_model else "CAG + BM25 RAG",
+                "indexed_chunks": len(agent.kb.chunks),
             })
         except Exception as exc:
             try:
@@ -837,10 +859,9 @@ class SpendingUIHandler(BaseHTTPRequestHandler):
 
     def _handle_analyze(self) -> None:
         try:
-            session_id, bundle = self._parse_upload_to_session()
+            session_id, bundle, agent = self._parse_upload_to_session()
             with SESSIONS_LOCK:
                 session = SESSIONS[session_id]
-            agent = session["agent"]
             stem = session["stem"]
             report_md, tools_used = agent.generate_full_report(fast_mode=True)
             md_path, html_path = save_reports(bundle, report_md, agent.model, REPORTS_DIR, stem=stem)
@@ -853,6 +874,7 @@ class SpendingUIHandler(BaseHTTPRequestHandler):
                 "report_markdown": report_md,
                 "md_filename": md_path.name,
                 "html_filename": html_path.name,
+                "indexed_chunks": len(agent.kb.chunks),
             })
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -873,8 +895,8 @@ class SpendingUIHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": "Session expired. Please re-analyze the sheet."}, status=HTTPStatus.NOT_FOUND)
                 return
 
-            answer = session["agent"].ask(question)
-            self._send_json({"answer": answer})
+            qa_res = session["agent"].ask_with_sources(question)
+            self._send_json(qa_res)
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
@@ -883,7 +905,7 @@ def run_server(host: str = "127.0.0.1", port: int = 8501, open_browser: bool = T
     SpendingUIHandler.ollama_host = ollama_host
     server = ThreadingHTTPServer((host, port), SpendingUIHandler)
     url = f"http://{host}:{port}"
-    print(f"Ollama Excel Spending Agent UI running at: {url}")
+    print(f"Ollama Universal Excel Agent UI running at: {url}")
     print("Press Ctrl+C to stop.")
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
@@ -896,7 +918,7 @@ def run_server(host: str = "127.0.0.1", port: int = 8501, open_browser: bool = T
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Start the Web UI for Ollama Excel Spending Agent.")
+    parser = argparse.ArgumentParser(description="Start the Web UI for Ollama Universal Excel Agent.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8501)
     parser.add_argument("--no-browser", action="store_true")
