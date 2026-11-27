@@ -1,9 +1,11 @@
 """
-Ollama-powered Excel Spending Analyst Agent.
+Ollama-powered Universal Excel Report Analyst + Hybrid CAG & RAG Q&A Agent.
 
-Uses Ollama's /api/chat tool-calling loop so the local LLM inspects the Excel
-analytics tools for exact numbers, explains where you spend more, which month
-you spend / will spend more, and why it happens, and supports follow-up Q&A.
+- Supports spending trackers, bank statements, multi-tab monthly workbooks,
+  matrix/pivot budgets, and general non-date tabular reports across one or more files.
+- Report generation uses fast single-pass grounded synthesis (or --deep multi-tool).
+- Follow-up Q&A uses Hybrid CAG (Cache-Augmented Generation) + RAG
+  (BM25/Metadata/Optional-Vector Retrieval) with source citations.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from typing import Any, Callable
 import requests
 
 from excel_analyzer import ExpenseAnalyzer
+from rag_cag_engine import ReportKnowledgeBase
 
 
 DEFAULT_OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
@@ -40,7 +43,6 @@ def select_best_model(available: list[str], requested: str | None = None) -> str
     if requested:
         if requested in available:
             return requested
-        # Allow prefix match like "qwen2.5" -> "qwen2.5:latest"
         for m in available:
             if m.startswith(requested):
                 return m
@@ -63,7 +65,7 @@ def _build_tool_schemas() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "get_overview",
-                "description": "Get overall spending summary, date range, total spend, monthly average, largest expense, and detected columns.",
+                "description": "Get overall summary across all sheets/files, date range, total spend or key totals, and detected columns.",
                 "parameters": {"type": "object", "properties": {}, "required": []},
             },
         },
@@ -71,14 +73,11 @@ def _build_tool_schemas() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "get_where_you_spend_more",
-                "description": "Get top spending categories, top merchants/descriptions, most frequent merchants, and payment modes.",
+                "description": "Get top spending categories/groups, top merchants, most frequent items, and payment modes.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "top_n": {
-                            "type": "integer",
-                            "description": "Number of top categories and merchants to return (default 10).",
-                        }
+                        "top_n": {"type": "integer", "description": "Number of top categories/merchants (default 10)."}
                     },
                     "required": [],
                 },
@@ -88,7 +87,7 @@ def _build_tool_schemas() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "get_monthly_spending",
-                "description": "Get month-by-month spending totals, month-over-month changes, peak spending month, and lowest spending month.",
+                "description": "Get month-by-month spending totals, MoM changes, peak month, and lowest month.",
                 "parameters": {"type": "object", "properties": {}, "required": []},
             },
         },
@@ -96,7 +95,7 @@ def _build_tool_schemas() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "get_future_month_forecast",
-                "description": "Get spending trend, recurring fixed commitments, seasonal calendar-month ranking, and projected spending for the next 3 months.",
+                "description": "Get spending trend, recurring bills, seasonal ranking, and projected spending for the next 3 months.",
                 "parameters": {"type": "object", "properties": {}, "required": []},
             },
         },
@@ -104,14 +103,11 @@ def _build_tool_schemas() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "explain_why_it_happens",
-                "description": "Get root-cause drivers for why spending spiked in a target month (defaults to peak month): surging categories vs baseline, spike transactions, frequency vs ticket size, and weekday/weekend habits.",
+                "description": "Get root-cause drivers for why spending spiked in a target month (defaults to peak month).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "target_month": {
-                            "type": "string",
-                            "description": "Optional month in YYYY-MM format. Omit to analyze the highest-spending peak month.",
-                        }
+                        "target_month": {"type": "string", "description": "Optional YYYY-MM month."}
                     },
                     "required": [],
                 },
@@ -121,13 +117,13 @@ def _build_tool_schemas() -> list[dict[str, Any]]:
             "type": "function",
             "function": {
                 "name": "search_transactions",
-                "description": "Search and filter individual transactions by month, category, keyword, or minimum amount.",
+                "description": "Filter transactions by month, category, keyword, or minimum amount.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "month": {"type": "string", "description": "Filter by YYYY-MM month."},
                         "category": {"type": "string", "description": "Filter by category substring."},
-                        "keyword": {"type": "string", "description": "Filter by description/category keyword."},
+                        "keyword": {"type": "string", "description": "Filter by description/sheet/file keyword."},
                         "min_amount": {"type": "number", "description": "Minimum transaction amount."},
                         "limit": {"type": "integer", "description": "Max transactions to return (default 15)."},
                     },
@@ -135,23 +131,37 @@ def _build_tool_schemas() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "search_report_knowledge",
+                "description": "RAG search across ALL sheets, rows, summaries, and generated report sections.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query for the report knowledge base."},
+                        "top_k": {"type": "integer", "description": "Number of top chunks to return (default 6)."},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
     ]
 
 
-SYSTEM_PROMPT = """You are an expert Personal Finance & Excel Spending Analyst AI Agent running on Ollama.
-
-Your job is to analyze the user's Excel expense sheet accurately using the provided analytical tools and write a clear, practical, insightful report.
+SYSTEM_PROMPT = """You are an expert Financial & Excel Report Analyst AI Agent running on Ollama with Hybrid CAG + RAG capabilities.
 
 Strict rules:
-1. ALWAYS call the analytical tools before answering. Never invent, guess, or round numbers differently from tool outputs.
-2. Always include the exact currency symbol reported by `get_overview` when mentioning amounts.
-3. Explicitly answer ALL four parts of the user's request clearly with headings:
-   - **Spending Overview Report** (total spend, date range, monthly average, transaction count, income/net if available)
-   - **Where You Spend More** (top categories with % share, top merchants/payees, and frequent small drains)
-   - **Which Month You Spend More (Peak Month & Upcoming Forecast)** (identify the highest historical month AND explain which upcoming/seasonal month is projected to have higher spending based on trend & recurring bills)
-   - **Why It Happens (Root Causes & Habits)** (explain the exact surging categories, specific big-ticket spike transactions, frequency vs ticket-size shifts, and weekend/timing habits)
-   - **Actionable Savings Plan** (3–5 concrete, data-backed steps tailored to the user's real numbers)
-4. Keep the tone helpful, crisp, and easy for anyone to read. Use markdown tables or bullet lists where helpful.
+1. Ground every single number, date, sheet name, and entity ONLY in the verified CAG context, RAG chunks, or tool outputs provided. Never invent or guess figures.
+2. Always include the exact currency symbol when quoting monetary amounts.
+3. For spending/budget reports, clearly cover:
+   - **Overview Report**
+   - **Where You Spend More** (top categories, merchants, frequent items)
+   - **Which Month You Spend More (Peak Month & Upcoming Forecast)**
+   - **Why It Happens** (category surges, spike transactions, habits/drivers)
+   - **Actionable Recommendations**
+4. For general non-date tabular reports (e.g., Sales, Inventory, P&L), summarize all sheets, top performers/outliers, trends/drivers, and actionable insights.
+5. In Q&A mode, cite the sheet/row or report section when referencing specific records, and say clearly if a fact is not present in the uploaded reports.
 """
 
 
@@ -169,7 +179,10 @@ class OllamaSpendingAgent:
         available = list_ollama_models(self.host)
         self.model = select_best_model(available, model)
         self.tools = _build_tool_schemas()
-        self.messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.kb = ReportKnowledgeBase(analyzer=analyzer, ollama_host=self.host, available_models=available)
+        self.messages: list[dict[str, Any]] = [
+            {"role": "system", "content": f"{SYSTEM_PROMPT}\n\n{self.kb.cag_context}"}
+        ]
         self._tool_calls_supported = True
 
     def _execute_tool(self, name: str, args: dict[str, Any]) -> str:
@@ -195,6 +208,13 @@ class OllamaSpendingAgent:
                     min_amount=args.get("min_amount"),
                     limit=int(args.get("limit", 15)),
                 )
+            elif name == "search_report_knowledge":
+                ret = self.kb.retrieve(query=str(args.get("query", "")), top_k=int(args.get("top_k", 6)))
+                res = {
+                    "retrieval_mode": ret["retrieval_mode"],
+                    "rag_chunks": ret["rag_chunks"],
+                    "structured_matches": ret["structured_matches"],
+                }
             else:
                 res = {"error": f"Unknown tool: {name}"}
         except Exception as exc:
@@ -203,63 +223,24 @@ class OllamaSpendingAgent:
         return json.dumps(res, ensure_ascii=False)
 
     def _build_compact_report_context(self) -> str:
-        """Build a token-efficient (~600 token) exact summary for fast single-pass reporting."""
+        """Build a token-efficient summary from the CAG context + spike drivers."""
+        if self.analyzer.meta.report_mode == "general_report":
+            lines = [self.kb.cag_context, "\nSAMPLE TOP ROWS PER SHEET:"]
+            for t in self.analyzer.sheet_tables[:5]:
+                lines.append(f"--- {t.file_name} :: {t.sheet_name} ---")
+                for idx, row in t.dataframe.head(5).iterrows():
+                    vals = [f"{c}={row[c]}" for c in t.columns if row[c] is not None and str(row[c]).strip() != ""]
+                    lines.append(f"Row {idx + 1}: " + " | ".join(vals[:8]))
+            return "\n".join(lines)
+
         ov = self.analyzer.get_overview()
         cur = ov["currency"]
-        where = self.analyzer.get_where_you_spend_more(top_n=7)
-        mon = self.analyzer.get_monthly_spending()
-        fc = self.analyzer.get_future_month_forecast()
         why = self.analyzer.explain_why_it_happens()
-
-        lines = [
-            f"FILE: {ov['file']} (Sheet: {ov['sheet']}) | Currency: {cur}",
-            f"RANGE: {ov['date_range']['start']} to {ov['date_range']['end']} ({ov['date_range']['num_months']} months) | Txns: {ov['transaction_count']}",
-            f"TOTAL SPEND: {cur}{ov['total_spend']:,.2f} | Avg/Month: {cur}{ov['average_monthly_spend']:,.2f} | Median/Month: {cur}{ov['median_monthly_spend']:,.2f}",
-        ]
-        if ov["total_income_detected"]:
-            lines.append(f"TOTAL INCOME: {cur}{ov['total_income_detected']:,.2f} | Net Cashflow: {cur}{ov['net_cashflow']:,.2f}")
-        lg = ov["largest_single_expense"]
-        lines.append(f"LARGEST TXN: {lg['date']} {lg['description']} ({lg['category']}) = {cur}{lg['amount']:,.2f}")
-
-        lines.append("\nTOP CATEGORIES (Where you spend more):")
-        for c in where["categories"]:
-            lines.append(f"- {c['category']}: {cur}{c['total_spend']:,.2f} ({c['share_percent']}%, {c['transaction_count']} txns, avg {cur}{c['average_transaction']:,.2f})")
-
-        lines.append("\nTOP MERCHANTS:")
-        for m in where["top_merchants_by_spend"][:5]:
-            lines.append(f"- {m['description']} [{m['category']}]: {cur}{m['total_spend']:,.2f} ({m['transaction_count']}x)")
-
-        lines.append("\nMOST FREQUENT:")
-        for f_m in where["most_frequent_merchants"][:4]:
-            lines.append(f"- {f_m['description']}: {f_m['transaction_count']}x, total {cur}{f_m['total_spend']:,.2f}")
-
-        lines.append("\nMONTHLY SPENDING:")
-        for m in mon["months_chronological"]:
-            tag = " [PEAK]" if m["month"] == mon["peak_month"]["month"] else ""
-            lines.append(f"- {m['month']}{tag}: {cur}{m['total_spend']:,.2f} ({m['vs_monthly_avg_percent']:+.1f}% vs avg, top: {m['top_category_in_month']})")
-
-        lines.append(f"\nFORECAST (Trend: {fc['trend_direction']}, Fixed recurring ~{cur}{fc['estimated_recurring_monthly_commitments']:,.2f}/mo):")
-        for nf in fc["next_3_months_forecast"]:
-            lines.append(f"- {nf['month']} ({nf['calendar_month']}): projected {cur}{nf['projected_spend']:,.2f} ({nf['vs_historical_avg_percent']:+.1f}% vs avg)")
-        if fc["recurring_items"]:
-            rec_str = ", ".join(f"{r['description']} ({cur}{r['typical_amount']:,.0f})" for r in fc["recurring_items"][:5])
-            lines.append(f"RECURRING BILLS: {rec_str}")
-
-        freq = why["frequency_vs_ticket_size"]
-        hab = why["overall_spending_habits"]
-        lines.append(f"\nWHY PEAK MONTH ({why['analyzed_month']}) HAPPENED (+{cur}{why['excess_spend_over_baseline']:,.2f} over {cur}{why['other_months_avg_total']:,.2f} baseline):")
-        lines.append(f"- Txns: {freq['target_month_transactions']} vs {freq['baseline_avg_transactions']} baseline | Avg ticket: {cur}{freq['target_month_avg_ticket']:,.2f} vs {cur}{freq['baseline_avg_ticket']:,.2f} baseline")
-        lines.append("SURGING CATEGORIES vs BASELINE:")
-        for d in why["top_category_surges"][:4]:
-            lines.append(f"- {d['category']}: {cur}{d['target_month_spend']:,.2f} vs {cur}{d['baseline_monthly_avg']:,.2f} avg ({d['difference']:+,.2f}, {d['percent_vs_baseline']:+.1f}%)")
-        lines.append("TOP SPIKE TRANSACTIONS IN PEAK MONTH:")
-        for t in why["top_transactions_in_month"][:5]:
-            lines.append(f"- {t['date']} {t['description']} ({t['category']}): {cur}{t['amount']:,.2f} ({t['share_of_month_percent']}% of month)")
-        lines.append(
-            f"HABITS: Weekend avg/day {cur}{hab['avg_spend_per_active_weekend_day']:,.2f} vs Weekday {cur}{hab['avg_spend_per_active_weekday']:,.2f} | "
-            f"Small frequent (<={cur}{hab['small_frequent_purchases']['threshold_amount']:,.0f}): {hab['small_frequent_purchases']['count']} txns = {hab['small_frequent_purchases']['share_percent']}% | "
-            f"Month split (Early/Mid/Late): {hab['month_timing_split_percent']['early_month_days_1_10']}% / {hab['month_timing_split_percent']['mid_month_days_11_20']}% / {hab['month_timing_split_percent']['late_month_days_21_31']}%"
-        )
+        lines = [self.kb.cag_context]
+        if why["top_transactions_in_month"]:
+            lines.append("\nTOP SPIKE TRANSACTIONS IN PEAK MONTH:")
+            for t in why["top_transactions_in_month"][:6]:
+                lines.append(f"- {t['date']} {t['description']} ({t['category']}): {cur}{t['amount']:,.2f} ({t['share_of_month_percent']}% of month)")
         return "\n".join(lines)
 
     def _call_ollama(
@@ -311,7 +292,6 @@ class OllamaSpendingAgent:
             payload.pop("think", None)
             resp = requests.post(f"{self.host}/api/chat", json=payload, timeout=240)
         if resp.status_code == 400 and use_tools and "tool" in resp.text.lower():
-            # Model doesn't support native tool calling; disable and retry cleanly
             self._tool_calls_supported = False
             payload.pop("tools", None)
             resp = requests.post(f"{self.host}/api/chat", json=payload, timeout=240)
@@ -324,28 +304,32 @@ class OllamaSpendingAgent:
         fast_mode: bool = True,
         on_token: Callable[[str], None] | None = None,
     ) -> tuple[str, list[str]]:
-        """Generate the full spending report (fast single-pass by default, or multi-step tool loop)."""
+        """Generate the full report across all sheets/files, then index it into the RAG knowledge base."""
         if fast_mode:
             compact_ctx = self._build_compact_report_context()
-            tools_used = [
-                "fast_bundle:overview",
-                "fast_bundle:where_you_spend_more",
-                "fast_bundle:monthly_spending",
-                "fast_bundle:future_forecast",
-                "fast_bundle:why_it_happens",
-            ]
+            tools_used = ["cag:global_report_context", "rag:indexed_all_sheets"]
             if self.on_tool_call:
-                self.on_tool_call("build_compact_report_context", {"mode": "fast"})
-            fast_prompt = (
-                "Here are the exact verified numbers computed from the Excel sheet:\n\n"
-                f"{compact_ctx}\n\n"
-                "Using ONLY these exact numbers and currency symbol, write a crisp, well-structured Spending Report covering:\n"
-                "1. **Spending Overview Report**\n"
-                "2. **Where You Spend More** (top categories, merchants, frequent small purchases)\n"
-                "3. **Which Month You Spend More (Peak Month & Upcoming Forecast)**\n"
-                "4. **Why It Happens** (surging categories, spike transactions, habits)\n"
-                "5. **Actionable Savings Plan** (3-5 concrete recommendations)"
-            )
+                self.on_tool_call("cag_fast_report", {"sheets": len(self.analyzer.sheet_tables)})
+
+            if self.analyzer.meta.report_mode == "general_report":
+                instructions = (
+                    "Using ONLY the exact verified CAG summary and sample rows above, write a clear, comprehensive Report covering:\n"
+                    "1. **Executive Overview** (files, sheets, row counts, key totals)\n"
+                    "2. **Top Categories / Group Breakdown & Where Values Concentrate**\n"
+                    "3. **Cross-Sheet Insights, Outliers & Key Drivers**\n"
+                    "4. **Actionable Recommendations**"
+                )
+            else:
+                instructions = (
+                    "Using ONLY the exact verified CAG summary and peak transactions above, write a crisp, well-structured Spending Report covering:\n"
+                    "1. **Spending Overview Report**\n"
+                    "2. **Where You Spend More** (top categories, merchants, frequent small purchases)\n"
+                    "3. **Which Month You Spend More (Peak Month & Upcoming Forecast)**\n"
+                    "4. **Why It Happens** (surging categories, spike transactions, habits)\n"
+                    "5. **Actionable Savings Plan** (3-5 concrete recommendations)"
+                )
+
+            fast_prompt = f"{compact_ctx}\n\n{instructions}"
             self.messages.append({"role": "user", "content": fast_prompt})
             data = self._call_ollama(
                 self.messages,
@@ -357,14 +341,14 @@ class OllamaSpendingAgent:
             )
             final_text = (data.get("message", {}).get("content") or "").strip()
             self.messages.append({"role": "assistant", "content": final_text})
+            self.kb.index_generated_report(final_text)
             return final_text, tools_used
 
-        tools_used: list[str] = []
+        tools_used = []
         seen_calls: set[tuple[str, str]] = set()
         prompt = (
-            "Analyze my Excel expense sheet thoroughly. Use your tools to gather the overview, "
-            "where I spend more (categories and merchants), monthly spending breakdown, future month forecast, "
-            "and why the peak spending happens. Call each needed tool once, then write the complete Spending Report."
+            "Analyze ALL sheets of the uploaded Excel report(s) thoroughly. Call each needed analytical tool once, "
+            "then write the complete Report."
         )
         self.messages.append({"role": "user", "content": prompt})
 
@@ -396,84 +380,94 @@ class OllamaSpendingAgent:
                     seen_calls.add(call_key)
                     tools_used.append(name)
                     result_json = self._execute_tool(name, raw_args)
-                    self.messages.append({
-                        "role": "tool",
-                        "content": result_json,
-                    })
+                    self.messages.append({"role": "tool", "content": result_json})
                 if all_duplicates:
                     break
                 continue
 
             content = (msg.get("content") or "").strip()
-            # Fallback: if model didn't call any tools on turn 1 (or tools aren't supported),
-            # inject exact precomputed analytics bundle so it never hallucinates.
             if not tools_used:
-                bundle = self.analyzer.build_full_analytics_bundle()
-                tools_used.extend(["bundle:overview", "bundle:where_you_spend_more", "bundle:monthly", "bundle:forecast", "bundle:why_peak_happened"])
-                grounded_prompt = (
-                    "Here are the exact verified analytics computed from the Excel sheet:\n\n"
-                    f"```json\n{json.dumps(bundle, indent=2, ensure_ascii=False)}\n```\n\n"
-                    "Using ONLY these exact numbers, write the complete report covering:\n"
-                    "1. Spending Overview Report\n"
-                    "2. Where You Spend More (Categories & Merchants)\n"
-                    "3. Which Month You Spend More (Peak Month & Upcoming Forecast)\n"
-                    "4. Why It Happens (Root Causes, Spike Transactions & Habits)\n"
-                    "5. Actionable Savings Recommendations"
-                )
-                self.messages[-1] = {"role": "user", "content": grounded_prompt}
-                fallback_data = self._call_ollama(self.messages, use_tools=False)
-                fallback_msg = fallback_data.get("message", {})
-                final_text = (fallback_msg.get("content") or "").strip()
-                self.messages.append({"role": "assistant", "content": final_text})
-                return final_text, tools_used
+                # Fallback to compact CAG grounded generation
+                self.messages.pop()
+                return self.generate_full_report(fast_mode=True, on_token=on_token)
 
             self.messages.append({"role": "assistant", "content": content})
+            self.kb.index_generated_report(content)
             return content, tools_used
 
-        # If max iterations reached, ask for final synthesis without tools
-        self.messages.append({
-            "role": "user",
-            "content": "You have gathered the data. Please write the final complete spending report now.",
-        })
-        final_data = self._call_ollama(self.messages, use_tools=False, num_ctx=8192, num_predict=600, disable_thinking=True)
+        self.messages.append({"role": "user", "content": "Write the final complete report now using the tool results above."})
+        final_data = self._call_ollama(self.messages, use_tools=False, disable_thinking=True)
         final_text = (final_data.get("message", {}).get("content") or "").strip()
         self.messages.append({"role": "assistant", "content": final_text})
+        self.kb.index_generated_report(final_text)
         return final_text, tools_used
 
-    def ask(self, question: str) -> str:
-        """Answer a follow-up question about the Excel sheet using tool calls if needed."""
-        self.messages.append({"role": "user", "content": question})
+    def ask_with_sources(self, question: str) -> dict[str, Any]:
+        """Answer any question using Hybrid CAG (cached system context) + RAG retrieval (+ tools if needed)."""
+        retrieval = self.kb.retrieve(question, top_k=8)
+        rag_block_lines = ["[RETRIEVED RAG EVIDENCE FROM REPORTS]"]
+        for ch in retrieval["rag_chunks"]:
+            rag_block_lines.append(f"- ({ch['source']}, score={ch['score']}): {ch['text']}")
+        if retrieval["structured_matches"]:
+            rag_block_lines.append("[EXACT STRUCTURED TABLE MATCHES]")
+            rag_block_lines.append(json.dumps(retrieval["structured_matches"], ensure_ascii=False))
 
+        augmented_user_msg = (
+            f"{chr(10).join(rag_block_lines)}\n\n"
+            f"USER QUESTION: {question}\n"
+            "Answer concisely and accurately using ONLY the CAG cached summary above and the retrieved RAG evidence. "
+            "Include exact amounts, currency, and cite the sheet/row or section where helpful."
+        )
+
+        # Keep conversation history compact (last 6 turns + system CAG prefix) so KV cache stays sharp
+        convo_tail = self.messages[1:][-6:]
+        qa_messages = [self.messages[0], *convo_tail, {"role": "user", "content": augmented_user_msg}]
+
+        ans = ""
         if not self._tool_calls_supported:
-            data = self._call_ollama(self.messages, use_tools=False, num_ctx=8192, num_predict=600, disable_thinking=True)
+            data = self._call_ollama(qa_messages, use_tools=False, num_ctx=8192, num_predict=600, disable_thinking=True)
             ans = (data.get("message", {}).get("content") or "").strip()
-            self.messages.append({"role": "assistant", "content": ans})
-            return ans
+        else:
+            for _ in range(3):
+                data = self._call_ollama(qa_messages, use_tools=True, num_ctx=8192, num_predict=600, disable_thinking=True)
+                msg = data.get("message", {})
+                tool_calls = msg.get("tool_calls") or []
+                if tool_calls:
+                    qa_messages.append(msg)
+                    for tc in tool_calls:
+                        fn = tc.get("function", {})
+                        name = fn.get("name", "")
+                        raw_args = fn.get("arguments") or {}
+                        if isinstance(raw_args, str):
+                            try:
+                                raw_args = json.loads(raw_args)
+                            except json.JSONDecodeError:
+                                raw_args = {}
+                        result_json = self._execute_tool(name, raw_args)
+                        qa_messages.append({"role": "tool", "content": result_json})
+                    continue
+                ans = (msg.get("content") or "").strip()
+                break
+            if not ans:
+                final_data = self._call_ollama(qa_messages, use_tools=False, num_ctx=8192, num_predict=600, disable_thinking=True)
+                ans = (final_data.get("message", {}).get("content") or "").strip()
 
-        for _ in range(5):
-            data = self._call_ollama(self.messages, use_tools=True, num_ctx=8192, num_predict=600, disable_thinking=True)
-            msg = data.get("message", {})
-            tool_calls = msg.get("tool_calls") or []
-            if tool_calls:
-                self.messages.append(msg)
-                for tc in tool_calls:
-                    fn = tc.get("function", {})
-                    name = fn.get("name", "")
-                    raw_args = fn.get("arguments") or {}
-                    if isinstance(raw_args, str):
-                        try:
-                            raw_args = json.loads(raw_args)
-                        except json.JSONDecodeError:
-                            raw_args = {}
-                    result_json = self._execute_tool(name, raw_args)
-                    self.messages.append({"role": "tool", "content": result_json})
-                continue
-
-            ans = (msg.get("content") or "").strip()
-            self.messages.append({"role": "assistant", "content": ans})
-            return ans
-
-        final_data = self._call_ollama(self.messages, use_tools=False, num_ctx=8192, num_predict=600, disable_thinking=True)
-        ans = (final_data.get("message", {}).get("content") or "").strip()
+        # Store clean user question + assistant answer in persistent conversation memory
+        self.messages.append({"role": "user", "content": question})
         self.messages.append({"role": "assistant", "content": ans})
-        return ans
+
+        return {
+            "answer": ans,
+            "retrieval_mode": retrieval["retrieval_mode"],
+            "cag_used": True,
+            "total_indexed_chunks": len(self.kb.chunks),
+            "citations": [
+                {"source": ch["source"], "kind": ch["kind"], "score": ch["score"]}
+                for ch in retrieval["rag_chunks"][:5]
+            ],
+            "structured_matches": retrieval["structured_matches"],
+        }
+
+    def ask(self, question: str) -> str:
+        """Backwards-compatible Q&A returning answer string."""
+        return self.ask_with_sources(question)["answer"]
